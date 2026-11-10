@@ -36,6 +36,7 @@ static uint32_t accel_classes;
 static HalCore1Accel run_accel_test(void);
 static Core1Program streaming_program;
 static uint32_t streaming_divider;
+static uint32_t streaming_rate;
 static EqualizerCurve equalizer_curve;
 static uint32_t equalizer_version;
 
@@ -149,16 +150,21 @@ static bool equalizer_moved(void)
     return false;
 }
 
-static bool equalizing(Core1Program program)
+static bool equalizing(Core1Program program, uint32_t rate)
 {
     (void)program;
-    return equalizer_moved();
+    return rate <= EQUALIZER_MAX_RATE && equalizer_moved();
 }
 
-static uint32_t stream_divider(Core1Program program, uint32_t pll_mhz)
+static bool hi_res(Core1Program program, uint32_t rate)
 {
-    bool heavy =
-        program == CORE1_PROGRAM_AAC || program == CORE1_PROGRAM_OPUS || equalizing(program);
+    return program == CORE1_PROGRAM_FLAC && rate > EQUALIZER_MAX_RATE;
+}
+
+static uint32_t stream_divider(Core1Program program, uint32_t rate, uint32_t pll_mhz)
+{
+    bool heavy = program == CORE1_PROGRAM_AAC || program == CORE1_PROGRAM_OPUS ||
+                 equalizing(program, rate) || hi_res(program, rate);
     return heavy && pll_mhz <= FULL_SPEED_MHZ ? 1 : core1_divider_for(pll_mhz);
 }
 
@@ -176,7 +182,7 @@ void board_core1_set_equalizer(const EqualizerCurve *curve)
 {
     equalizer_curve = *curve;
     if (streaming) {
-        share_equalizer(equalizing(streaming_program) && streaming_divider == 1);
+        share_equalizer(equalizing(streaming_program, streaming_rate) && streaming_divider == 1);
     }
 }
 
@@ -192,10 +198,16 @@ void board_core1_follow_savings(void)
     }
 }
 
-bool board_core1_start_stream(Core1Program program)
+bool board_core1_needs_restart(Core1Program program, uint32_t rate)
 {
-    if (streaming && streaming_program == program &&
-        streaming_divider == stream_divider(program, hal_system_clock_mhz())) {
+    return streaming &&
+           (streaming_program != program ||
+            streaming_divider != stream_divider(program, rate, hal_system_clock_mhz()));
+}
+
+bool board_core1_start_stream(Core1Program program, uint32_t rate)
+{
+    if (streaming && !board_core1_needs_restart(program, rate)) {
         return true;
     }
     board_core1_stop();
@@ -208,7 +220,7 @@ bool board_core1_start_stream(Core1Program program)
         return false;
     }
     board_start_record_step(HAL_START_STEP_CORE1_START);
-    uint32_t divider = stream_divider(program, pll_mhz);
+    uint32_t divider = stream_divider(program, rate, pll_mhz);
     Core1Result result = core1_power_up(&BUS, pll_mhz, divider);
     if (result == CORE1_OK) {
         result = place_program(program);
@@ -216,7 +228,7 @@ bool board_core1_start_stream(Core1Program program)
     if (result == CORE1_OK) {
         register_write(CORE1_SHARED_COMMAND, CORE1_COMMAND_STREAM);
         register_write(CORE1_SHARED_ACCEL_CLASSES, accel_classes);
-        share_equalizer(equalizing(program) && divider == 1);
+        share_equalizer(equalizing(program, rate) && divider == 1);
         share_sleep();
         result = core1_run(&BUS, REPLY_TIMEOUT_MS);
     }
@@ -228,6 +240,7 @@ bool board_core1_start_stream(Core1Program program)
     streaming = true;
     streaming_program = program;
     streaming_divider = divider;
+    streaming_rate = rate;
     return true;
 }
 

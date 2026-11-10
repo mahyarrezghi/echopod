@@ -64,6 +64,11 @@ typedef enum SourceKind {
     SOURCE_UNKNOWN
 } SourceKind;
 
+typedef struct TrackProbe {
+    SourceKind kind;
+    uint32_t rate;
+} TrackProbe;
+
 typedef struct FlacMemory {
     FlacDecoder decoder;
     FlacBlockBuffer block;
@@ -113,7 +118,7 @@ static bool resting;
 static bool slow_allowed;
 static bool deferred;
 static bool queued_light;
-static int queued_program;
+static TrackProbe queued_probe;
 static uint32_t queued_token;
 static char queued_path[AUDIO_ENGINE_PATH_CAPACITY];
 static uint32_t rest_position_ms;
@@ -182,38 +187,73 @@ static bool tag_is(const uint8_t *bytes, const char *tag)
            bytes[2] == (uint8_t)tag[2] && bytes[3] == (uint8_t)tag[3];
 }
 
-static SourceKind kind_of(const char *path)
+static uint32_t le32_at(const uint8_t *bytes)
 {
-    HalFile local;
-    if (!hal_file_open(&local, path)) {
-        return SOURCE_FLAC;
+    return (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 | (uint32_t)bytes[2] << 16 |
+           (uint32_t)bytes[3] << 24;
+}
+
+static TrackProbe probe_mp4(FlacInput input)
+{
+    Mp4Track track;
+    if (!mp4_probe(input, &track)) {
+        return (TrackProbe){SOURCE_UNKNOWN, 0};
     }
-    FlacInput input = {.read = read_file, .context = &local, .size = local.size};
-    uint8_t magic[SNIFF_BYTES] = {0};
-    bool read = local.size >= SNIFF_BYTES && read_file(&local, 0, magic, sizeof magic);
-    if (read && mp4_signature(magic)) {
-        Mp4Track track;
-        bool probed = mp4_probe(input, &track);
-        hal_file_close(&local);
-        if (probed && track.codec == MP4_CODEC_ALAC) {
-            return SOURCE_ALAC;
-        }
-        return probed && track.object_type == MP4_OBJECT_AAC_LC ? SOURCE_AAC : SOURCE_UNKNOWN;
+    if (track.codec == MP4_CODEC_ALAC) {
+        return (TrackProbe){SOURCE_ALAC, track.sample_rate};
     }
-    if (read && ogg_signature(magic)) {
-        OggOpusInfo opus;
-        bool probed = ogg_opus_probe(input, &opus);
-        hal_file_close(&local);
-        return probed ? SOURCE_OPUS : SOURCE_UNKNOWN;
-    }
-    hal_file_close(&local);
+    bool aac = track.object_type == MP4_OBJECT_AAC_LC;
+    return (TrackProbe){aac ? SOURCE_AAC : SOURCE_UNKNOWN, aac ? track.sample_rate : 0};
+}
+
+static TrackProbe probe_ogg(FlacInput input)
+{
+    OggOpusInfo opus;
+    return (TrackProbe){ogg_opus_probe(input, &opus) ? SOURCE_OPUS : SOURCE_UNKNOWN, 0};
+}
+
+static TrackProbe probe_header(const uint8_t *magic, bool read)
+{
     if (!read || tag_is(magic, "fLaC")) {
-        return SOURCE_FLAC;
+        const uint8_t *rate = magic + FLAC_RATE_OFFSET;
+        return (TrackProbe){SOURCE_FLAC, (uint32_t)rate[0] << 12 | (uint32_t)rate[1] << 4 |
+                                             (uint32_t)rate[2] >> 4};
     }
     if (tag_is(magic, "RIFF") && tag_is(magic + 8, "WAVE")) {
-        return SOURCE_WAV;
+        bool format_first = tag_is(magic + WAV_FORMAT_OFFSET, "fmt ");
+        return (TrackProbe){SOURCE_WAV, format_first ? le32_at(magic + WAV_RATE_OFFSET) : 0};
     }
-    return mp3_signature(magic) ? SOURCE_MP3 : SOURCE_UNKNOWN;
+    return (TrackProbe){mp3_signature(magic) ? SOURCE_MP3 : SOURCE_UNKNOWN, 0};
+}
+
+static TrackProbe probe_input(FlacInput input)
+{
+    uint8_t magic[LIGHT_SNIFF_BYTES] = {0};
+    uint32_t length = input.size < LIGHT_SNIFF_BYTES ? input.size : LIGHT_SNIFF_BYTES;
+    bool read = input.size >= SNIFF_BYTES && input.read(input.context, 0, magic, length);
+    if (read && mp4_signature(magic)) {
+        return probe_mp4(input);
+    }
+    if (read && ogg_signature(magic)) {
+        return probe_ogg(input);
+    }
+    TrackProbe probe = probe_header(magic, read);
+    if (input.size < LIGHT_SNIFF_BYTES) {
+        probe.rate = 0;
+    }
+    return probe;
+}
+
+static TrackProbe probe_path(const char *path)
+{
+    HalFile open;
+    if (path == NULL || !hal_file_open(&open, path)) {
+        return (TrackProbe){SOURCE_FLAC, 0};
+    }
+    TrackProbe probe =
+        probe_input((FlacInput){.read = read_file, .context = &open, .size = open.size});
+    hal_file_close(&open);
+    return probe;
 }
 
 static Core1Program program_for(SourceKind kind)
@@ -225,23 +265,6 @@ static Core1Program program_for(SourceKind kind)
         return CORE1_PROGRAM_OPUS;
     }
     return kind == SOURCE_AAC ? CORE1_PROGRAM_AAC : CORE1_PROGRAM_FLAC;
-}
-
-static int program_of(SourceKind kind)
-{
-    switch (kind) {
-    case SOURCE_FLAC:
-    case SOURCE_ALAC:
-        return CORE1_PROGRAM_FLAC;
-    case SOURCE_MP3:
-        return CORE1_PROGRAM_MP3;
-    case SOURCE_AAC:
-        return CORE1_PROGRAM_AAC;
-    case SOURCE_OPUS:
-        return CORE1_PROGRAM_OPUS;
-    default:
-        return -1;
-    }
 }
 
 static AudioSource chosen_source(void)
@@ -281,17 +304,18 @@ static bool open_chosen(void *context, const char *path, uint32_t start_ms, Audi
 {
     (void)context;
     remember(last_path, path);
-    source_kind = kind_of(path);
+    TrackProbe probe = probe_path(path);
+    source_kind = probe.kind;
     unknown_format = source_kind == SOURCE_UNKNOWN;
     if (unknown_format) {
         return false;
     }
     if (source_kind == SOURCE_FLAC) {
         flac_use_block_buffer(&decoding.flac.decoder, &decoding.flac.block);
-        using_core1 = board_core1_start_stream(CORE1_PROGRAM_FLAC);
+        using_core1 = board_core1_start_stream(CORE1_PROGRAM_FLAC, probe.rate);
     }
     if (source_kind != SOURCE_FLAC && source_kind != SOURCE_WAV) {
-        using_core1 = board_core1_start_stream(program_for(source_kind));
+        using_core1 = board_core1_start_stream(program_for(source_kind), probe.rate);
         if (!using_core1) {
             return false;
         }
@@ -515,43 +539,19 @@ static void ensure_audio_clock(void)
     }
 }
 
-static uint32_t le32_at(const uint8_t *bytes)
+static bool light_probe(TrackProbe probe)
 {
-    return (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 | (uint32_t)bytes[2] << 16 |
-           (uint32_t)bytes[3] << 24;
-}
-
-static uint32_t light_rate(HalFile *open)
-{
-    uint8_t bytes[LIGHT_SNIFF_BYTES] = {0};
-    FlacInput input = {.read = read_file, .context = open, .size = open->size};
-    if (open->size < LIGHT_SNIFF_BYTES || !read_file(open, 0, bytes, sizeof bytes)) {
-        return 0;
+    if (probe.kind == SOURCE_MP3) {
+        return true;
     }
-    if (tag_is(bytes, "fLaC")) {
-        const uint8_t *rate = bytes + FLAC_RATE_OFFSET;
-        return (uint32_t)rate[0] << 12 | (uint32_t)rate[1] << 4 | (uint32_t)rate[2] >> 4;
-    }
-    if (tag_is(bytes, "RIFF") && tag_is(bytes + 8, "WAVE") &&
-        tag_is(bytes + WAV_FORMAT_OFFSET, "fmt ")) {
-        return le32_at(bytes + WAV_RATE_OFFSET);
-    }
-    if (mp4_signature(bytes)) {
-        Mp4Track track;
-        return mp4_probe(input, &track) && track.codec == MP4_CODEC_ALAC ? track.sample_rate : 0;
-    }
-    return !ogg_signature(bytes) && mp3_signature(bytes) ? SLOW_CLOCK_MAX_RATE : 0;
+    bool lossless =
+        probe.kind == SOURCE_FLAC || probe.kind == SOURCE_WAV || probe.kind == SOURCE_ALAC;
+    return lossless && probe.rate > 0 && probe.rate <= SLOW_CLOCK_MAX_RATE;
 }
 
 static bool light_track(const char *path)
 {
-    HalFile open;
-    if (path == NULL || !hal_file_open(&open, path)) {
-        return false;
-    }
-    uint32_t rate = light_rate(&open);
-    hal_file_close(&open);
-    return rate > 0 && rate <= SLOW_CLOCK_MAX_RATE;
+    return path != NULL && light_probe(probe_path(path));
 }
 
 static bool equalizer_on(void)
@@ -579,13 +579,21 @@ static void choose_clock(const char *path)
     }
 }
 
+static bool core1_restart_for(TrackProbe probe)
+{
+    if (probe.kind == SOURCE_WAV || probe.kind == SOURCE_UNKNOWN) {
+        return false;
+    }
+    return board_core1_needs_restart(program_for(probe.kind), probe.rate);
+}
+
 static void follow_queue(void)
 {
     if (!engine_ready || queued_path[0] == '\0') {
         return;
     }
     bool restart = stream_service == NULL && (clock_for(queued_light) != hal_system_clock_mhz() ||
-                                              program_of(source_kind) != queued_program);
+                                              core1_restart_for(queued_probe));
     audio_engine_queue_next(&engine, restart ? NULL : queued_path, queued_token);
     deferred = restart;
 }
@@ -616,11 +624,10 @@ void hal_audio_queue_next(const char *path, uint32_t token)
     queued_path[0] = '\0';
     audio_engine_queue_next(&engine, path, token);
     if (path == NULL) {
-        queued_program = -1;
         return;
     }
-    queued_light = board_saving(HAL_SAVING_SLOW_CLOCK) && light_track(path);
-    queued_program = program_of(kind_of(path));
+    queued_probe = probe_path(path);
+    queued_light = board_saving(HAL_SAVING_SLOW_CLOCK) && light_probe(queued_probe);
     queued_token = token;
     remember(queued_path, path);
     follow_queue();
